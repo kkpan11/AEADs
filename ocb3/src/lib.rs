@@ -13,20 +13,19 @@ pub mod consts {
     pub use cipher::consts::{U0, U12, U15, U16, U6};
 }
 
-mod util;
-
 pub use aead::{
     self,
     array::{Array, AssocArraySize},
     AeadCore, AeadInPlace, Error, KeyInit, KeySizeUser,
 };
 
-use crate::util::{double, inplace_xor, ntz, Block};
+use aead::array::ArraySize;
 use cipher::{
     consts::{U0, U12, U16},
     BlockCipherDecrypt, BlockCipherEncrypt, BlockSizeUser, Unsigned,
 };
 use core::marker::PhantomData;
+use dbl::Dbl;
 use subtle::ConstantTimeEq;
 
 /// Number of L values to be precomputed. Precomputing m values, allows
@@ -55,6 +54,8 @@ pub type Nonce<NonceSize> = Array<u8, NonceSize>;
 
 /// OCB3 tag
 pub type Tag<TagSize> = Array<u8, TagSize>;
+
+pub(crate) type Block = Array<u8, U16>;
 
 mod sealed {
     use aead::array::{
@@ -140,10 +141,6 @@ where
     ll: [Block; L_TABLE_SIZE],
 }
 
-/// Output of the HASH function defined in https://www.rfc-editor.org/rfc/rfc7253.html#section-4.1
-type SumSize = U16;
-type Sum = Array<u8, SumSize>;
-
 impl<Cipher, NonceSize, TagSize> KeySizeUser for Ocb3<Cipher, NonceSize, TagSize>
 where
     Cipher: KeySizeUser,
@@ -192,26 +189,6 @@ where
             ll,
         }
     }
-}
-
-/// Computes key-dependent variables defined in
-/// https://www.rfc-editor.org/rfc/rfc7253.html#section-4.1
-fn key_dependent_variables<Cipher: BlockSizeUser<BlockSize = U16> + BlockCipherEncrypt>(
-    cipher: &Cipher,
-) -> (Block, Block, [Block; L_TABLE_SIZE]) {
-    let mut zeros = [0u8; 16];
-    let ll_star = Block::from_mut_slice(&mut zeros);
-    cipher.encrypt_block(ll_star);
-    let ll_dollar = double(ll_star);
-
-    let mut ll = [Block::default(); L_TABLE_SIZE];
-    let mut ll_i = ll_dollar;
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..L_TABLE_SIZE {
-        ll_i = double(&ll_i);
-        ll[i] = ll_i
-    }
-    (*ll_star, ll_dollar, ll)
 }
 
 impl<Cipher, NonceSize, TagSize> AeadInPlace for Ocb3<Cipher, NonceSize, TagSize>
@@ -366,7 +343,6 @@ where
     /// Adapted from https://www.cs.ucdavis.edu/~rogaway/ocb/news/code/ocb.c
     fn wide_encrypt(&self, nonce: &Nonce<NonceSize>, buffer: &mut [u8]) -> (usize, Block, Block) {
         const WIDTH: usize = 2;
-        let split_into_blocks = crate::util::split_into_two_blocks;
 
         let mut i = 1;
 
@@ -374,7 +350,7 @@ where
         offset_i[offset_i.len() - 1] = initial_offset(&self.cipher, nonce, TagSize::to_u32());
         let mut checksum_i = Block::default();
         for wide_blocks in buffer.chunks_exact_mut(<Block as AssocArraySize>::Size::USIZE * WIDTH) {
-            let p_i = split_into_blocks(wide_blocks);
+            let p_i = split_into_two_blocks(wide_blocks);
 
             // checksum_i = checksum_{i-1} xor p_i
             for p_ij in &p_i {
@@ -409,7 +385,6 @@ where
     /// Adapted from https://www.cs.ucdavis.edu/~rogaway/ocb/news/code/ocb.c
     fn wide_decrypt(&self, nonce: &Nonce<NonceSize>, buffer: &mut [u8]) -> (usize, Block, Block) {
         const WIDTH: usize = 2;
-        let split_into_blocks = crate::util::split_into_two_blocks;
 
         let mut i = 1;
 
@@ -417,7 +392,7 @@ where
         offset_i[offset_i.len() - 1] = initial_offset(&self.cipher, nonce, TagSize::to_u32());
         let mut checksum_i = Block::default();
         for wide_blocks in buffer.chunks_exact_mut(16 * WIDTH) {
-            let c_i = split_into_blocks(wide_blocks);
+            let c_i = split_into_two_blocks(wide_blocks);
 
             // offset_i = offset_{i-1} xor L_{ntz(i)}
             offset_i[0] = offset_i[offset_i.len() - 1];
@@ -440,9 +415,84 @@ where
         }
 
         let processed_bytes = (buffer.len() / (WIDTH * 16)) * (WIDTH * 16);
-
         (processed_bytes, offset_i[offset_i.len() - 1], checksum_i)
     }
+
+    /// Computes HASH function defined in https://www.rfc-editor.org/rfc/rfc7253.html#section-4.1
+    fn hash(&self, associated_data: &[u8]) -> Block {
+        let mut offset_i = Block::default();
+        let mut sum_i = Block::default();
+
+        let mut i = 1;
+        for a_i in associated_data.chunks_exact(16) {
+            // offset_i = offset_{i-1} xor L_{ntz(i)}
+            inplace_xor(&mut offset_i, &self.ll[ntz(i)]);
+            // Sum_i = Sum_{i-1} xor ENCIPHER(K, A_i xor offset_i)
+            let mut a_i = *Block::from_slice(a_i);
+            inplace_xor(&mut a_i, &offset_i);
+            self.cipher.encrypt_block(&mut a_i);
+            inplace_xor(&mut sum_i, &a_i);
+
+            i += 1;
+        }
+
+        // Process any partial blocks.
+        if (associated_data.len() % 16) != 0 {
+            let processed_bytes = (i - 1) * 16;
+            let remaining_bytes = associated_data.len() - processed_bytes;
+
+            // offset_* = offset_m xor L_*
+            inplace_xor(&mut offset_i, &self.ll_star);
+            // CipherInput = (A_* || 1 || zeros(127-bitlen(A_*))) xor offset_*
+            let cipher_input = &mut [0u8; 16];
+            cipher_input[..remaining_bytes].copy_from_slice(&associated_data[processed_bytes..]);
+            cipher_input[remaining_bytes] = 0b1000_0000;
+            let cipher_input = Block::from_mut_slice(cipher_input);
+            inplace_xor(cipher_input, &offset_i);
+            // Sum = Sum_m xor ENCIPHER(K, CipherInput)
+            self.cipher.encrypt_block(cipher_input);
+            inplace_xor(&mut sum_i, cipher_input);
+        }
+
+        sum_i
+    }
+
+    fn compute_tag(
+        &self,
+        associated_data: &[u8],
+        checksum_m: &mut Block,
+        offset_m: &Block,
+    ) -> Tag<TagSize> {
+        // Tag = ENCIPHER(K, checksum_m xor offset_m xor L_$) xor HASH(K,A)
+        let full_tag = checksum_m;
+        inplace_xor(full_tag, offset_m);
+        inplace_xor(full_tag, &self.ll_dollar);
+        self.cipher.encrypt_block(full_tag);
+        inplace_xor(full_tag, &self.hash(associated_data));
+
+        // truncate the tag to the required length
+        Tag::clone_from_slice(&full_tag[..TagSize::to_usize()])
+    }
+}
+
+/// Computes key-dependent variables defined in
+/// https://www.rfc-editor.org/rfc/rfc7253.html#section-4.1
+fn key_dependent_variables<Cipher: BlockSizeUser<BlockSize = U16> + BlockCipherEncrypt>(
+    cipher: &Cipher,
+) -> (Block, Block, [Block; L_TABLE_SIZE]) {
+    let mut zeros = [0u8; 16];
+    let ll_star = Block::from_mut_slice(&mut zeros);
+    cipher.encrypt_block(ll_star);
+    let ll_dollar = ll_star.dbl();
+
+    let mut ll = [Block::default(); L_TABLE_SIZE];
+    let mut ll_i = ll_dollar;
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..L_TABLE_SIZE {
+        ll_i = ll_i.dbl();
+        ll[i] = ll_i
+    }
+    (*ll_star, ll_dollar, ll)
 }
 
 /// Computes nonce-dependent variables as defined
@@ -504,81 +554,46 @@ fn initial_offset<
     offset.to_be_bytes().into()
 }
 
-impl<Cipher, NonceSize, TagSize> Ocb3<Cipher, NonceSize, TagSize>
+#[inline]
+pub(crate) fn inplace_xor<T, U>(a: &mut Array<T, U>, b: &Array<T, U>)
 where
-    Cipher: BlockSizeUser<BlockSize = U16> + BlockCipherEncrypt,
-    NonceSize: sealed::NonceSizes,
-    TagSize: sealed::TagSizes,
+    U: ArraySize,
+    T: core::ops::BitXor<Output = T> + Copy,
 {
-    /// Computes HASH function defined in https://www.rfc-editor.org/rfc/rfc7253.html#section-4.1
-    fn hash(&self, associated_data: &[u8]) -> Sum {
-        let mut offset_i = Block::default();
-        let mut sum_i = Block::default();
-
-        let mut i = 1;
-        for a_i in associated_data.chunks_exact(16) {
-            // offset_i = offset_{i-1} xor L_{ntz(i)}
-            inplace_xor(&mut offset_i, &self.ll[ntz(i)]);
-            // Sum_i = Sum_{i-1} xor ENCIPHER(K, A_i xor offset_i)
-            let mut a_i = *Block::from_slice(a_i);
-            inplace_xor(&mut a_i, &offset_i);
-            self.cipher.encrypt_block(&mut a_i);
-            inplace_xor(&mut sum_i, &a_i);
-
-            i += 1;
-        }
-
-        // Process any partial blocks.
-        if (associated_data.len() % 16) != 0 {
-            let processed_bytes = (i - 1) * 16;
-            let remaining_bytes = associated_data.len() - processed_bytes;
-
-            // offset_* = offset_m xor L_*
-            inplace_xor(&mut offset_i, &self.ll_star);
-            // CipherInput = (A_* || 1 || zeros(127-bitlen(A_*))) xor offset_*
-            let cipher_input = &mut [0u8; 16];
-            cipher_input[..remaining_bytes].copy_from_slice(&associated_data[processed_bytes..]);
-            cipher_input[remaining_bytes] = 0b1000_0000;
-            let cipher_input = Block::from_mut_slice(cipher_input);
-            inplace_xor(cipher_input, &offset_i);
-            // Sum = Sum_m xor ENCIPHER(K, CipherInput)
-            self.cipher.encrypt_block(cipher_input);
-            inplace_xor(&mut sum_i, cipher_input);
-        }
-
-        sum_i
+    for (aa, bb) in a.as_mut_slice().iter_mut().zip(b.as_slice()) {
+        *aa = *aa ^ *bb;
     }
+}
 
-    fn compute_tag(
-        &self,
-        associated_data: &[u8],
-        checksum_m: &mut Block,
-        offset_m: &Block,
-    ) -> Tag<TagSize> {
-        // Tag = ENCIPHER(K, checksum_m xor offset_m xor L_$) xor HASH(K,A)
-        let full_tag = checksum_m;
-        inplace_xor(full_tag, offset_m);
-        inplace_xor(full_tag, &self.ll_dollar);
-        self.cipher.encrypt_block(full_tag);
-        inplace_xor(full_tag, &self.hash(associated_data));
+/// Counts the number of non-trailing zeros in the binary representation.
+///
+/// Defined in https://www.rfc-editor.org/rfc/rfc7253.html#section-2
+#[inline]
+pub(crate) fn ntz(n: usize) -> usize {
+    n.trailing_zeros() as usize
+}
 
-        // truncate the tag to the required length
-        Tag::clone_from_slice(&full_tag[..TagSize::to_usize()])
-    }
+#[inline]
+pub(crate) fn split_into_two_blocks(two_blocks: &mut [u8]) -> [&mut Block; 2] {
+    const BLOCK_SIZE: usize = 16;
+    debug_assert_eq!(two_blocks.len(), BLOCK_SIZE * 2);
+    let (b0, b1) = two_blocks.split_at_mut(BLOCK_SIZE);
+    [b0.try_into().unwrap(), b1.try_into().unwrap()]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbl::Dbl;
     use hex_literal::hex;
 
     #[test]
     fn double_basic_test() {
         let zero = Block::from(hex!("00000000000000000000000000000000"));
-        assert_eq!(zero, double(&zero));
+        assert_eq!(zero, zero.dbl());
         let one = Block::from(hex!("00000000000000000000000000000001"));
         let two = Block::from(hex!("00000000000000000000000000000002"));
-        assert_eq!(two, double(&one));
+        assert_eq!(two, one.dbl());
     }
 
     #[test]
